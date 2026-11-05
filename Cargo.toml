@@ -1,0 +1,17 @@
+[package]
+name = "rexsim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A live iOS Simulator inside a Rex terminal pane, drawn with the Kitty graphics protocol"
+repository = "https://github.com/Bethel-nz/rexsim"
+keywords = ["ios", "simulator", "terminal", "rex", "kitty-graphics"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+simdriver = "0.2.4"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
