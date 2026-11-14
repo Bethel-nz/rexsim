@@ -144,7 +144,7 @@ struct Layout {
 
 /// Rows under the phone: the stats line with `--stats`, else none.
 static CHROME_ROWS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-/// Rows above the phone: the glass button bar (two rows) and a row of air.
+/// Rows above the phone: the glass button bar (`BAR_ROWS`) and the air under it.
 const TOP_ROWS: u16 = 5;
 fn chrome_rows() -> u16 {
     CHROME_ROWS.load(Ordering::Relaxed)
@@ -202,23 +202,50 @@ struct HwRect {
     col1: u16,
 }
 
-/// The glass bar spans the phone's width in the top two rows. Button slots match the
-/// drawing in bar.swift: equal slots inside the capsule's rounded ends.
+/// How many rows the bar is tall.
+const BAR_ROWS: u16 = 3;
+
+/// The bar's buttons in groups, each drawn as its own glass pill: Home and Apps, Lock and
+/// Siri, volume down and up. Counts follow `HW`'s order.
+const BAR_GROUPS: [usize; 3] = [2, 2, 2];
+
+/// Each button's slot, `(x0, x1)` in pixels of a `w`×`h` bar image, in `HW`'s order. The
+/// pills are centred and shrink only when the phone is too narrow for them. bar.swift
+/// draws these exact slots, so a click lands on the button that's drawn there.
+fn bar_slots(w: f64, h: f64) -> Vec<(f64, f64)> {
+    let pill_h = h - 8.0;
+    let (mut bw, mut gap) = (pill_h * 1.2, pill_h * 0.4);
+    let total = |bw: f64, gap: f64| bw * HW.len() as f64 + gap * (BAR_GROUPS.len() - 1) as f64;
+    let room = w - 8.0;
+    if total(bw, gap) > room {
+        let k = room / total(bw, gap);
+        bw *= k;
+        gap *= k;
+    }
+    let mut x = (w - total(bw, gap)) / 2.0;
+    let mut out = Vec::with_capacity(HW.len());
+    for n in BAR_GROUPS {
+        for _ in 0..n {
+            out.push((x, x + bw));
+            x += bw;
+        }
+        x += gap;
+    }
+    out
+}
+
+/// The bar sits in the top `BAR_ROWS` rows, over the phone's columns.
 fn toolbar(_ws: WinSize, l: &Layout, cell: (f64, f64)) -> Vec<HwRect> {
     let (cw, ch) = cell;
-    let w = l.cols as f64 * cw;
-    let inset = 6.0;
-    let bar_h = 2.0 * ch - inset * 2.0;
-    let slot = (w - inset * 2.0 - bar_h * 0.4) / HW.len() as f64;
-    let x0 = inset + bar_h * 0.2;
+    let slots = bar_slots((l.cols as f64 * cw).round(), (BAR_ROWS as f64 * ch).round());
     HW.iter()
-        .enumerate()
-        .map(|(i, (hw, _))| HwRect {
+        .zip(slots)
+        .map(|((hw, _), (x0, x1))| HwRect {
             hw: *hw,
             row: 0,
-            row1: 1,
-            col0: l.col0 + ((x0 + slot * i as f64) / cw) as u16,
-            col1: l.col0 + ((x0 + slot * (i + 1) as f64) / cw).ceil() as u16,
+            row1: BAR_ROWS - 1,
+            col0: l.col0 + (x0 / cw) as u16,
+            col1: l.col0 + (x1 / cw).ceil() as u16,
         })
         .collect()
 }
@@ -226,7 +253,7 @@ fn toolbar(_ws: WinSize, l: &Layout, cell: (f64, f64)) -> Vec<HwRect> {
 /// Where the compiled bar renderer lives; built from bar.swift on first use.
 fn bar_tool() -> Option<std::path::PathBuf> {
     let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Library/Caches/rexsim");
-    let bin = dir.join("bar-v1");
+    let bin = dir.join("bar-v3");
     if bin.exists() {
         return Some(bin);
     }
@@ -315,10 +342,12 @@ fn scene(pw: u32, ph: u32, screen: (f64, f64, f64, f64)) -> Option<(Vec<u8>, Vec
 fn bar_png(w: u32, h: u32, pressed: Option<usize>) -> Option<Vec<u8>> {
     let tool = bar_tool()?;
     let p = pressed.map_or(-1, |i| i as i64);
-    let out = tool.with_file_name(format!("bar-{w}x{h}-{p}.png"));
+    let out = tool.with_file_name(format!("bar3-{w}x{h}-{p}.png"));
     if !out.exists() {
+        let slots: Vec<String> = bar_slots(w as f64, h as f64).iter().map(|(a, b)| format!("{a:.1}:{b:.1}")).collect();
+        let groups: Vec<String> = BAR_GROUPS.iter().map(|n| n.to_string()).collect();
         std::process::Command::new(&tool)
-            .args([w.to_string(), h.to_string(), p.to_string(), "2".into(), out.to_str()?.into()])
+            .args([w.to_string(), h.to_string(), p.to_string(), slots.join(","), groups.join(","), out.to_str()?.into()])
             .status()
             .ok()?;
     }
@@ -507,10 +536,10 @@ fn draw_toolbar(out: &mut impl Write, l: &Layout, cell: (f64, f64), pressed: Opt
         return;
     }
     let w = (l.cols as f64 * cell.0).round() as u32;
-    let h = (2.0 * cell.1).round() as u32;
+    let h = (BAR_ROWS as f64 * cell.1).round() as u32;
     let idx = pressed.and_then(|p| HW.iter().position(|(hw, _)| *hw == p));
     if let Some(png) = bar_png(w, h, idx) {
-        send_png(out, 10, 0, l.col0, l.cols, 2, 5, &png);
+        send_png(out, 10, 0, l.col0, l.cols, BAR_ROWS, 5, &png);
     }
 }
 
