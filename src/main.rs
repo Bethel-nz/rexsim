@@ -21,7 +21,7 @@ use simdriver::{Button, DeviceSelector, Driver, Event, Frame, Modifiers, Options
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 /// When to grab the home screen as the pane's wallpaper: at start, and just after Home.
 static WALL_DUE: Mutex<Option<Instant>> = Mutex::new(None);
+/// Bumped a moment after Home, so rexsim's own wallpaper is redrawn.
+static WALL_GEN: AtomicU32 = AtomicU32::new(0);
 static LOG: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
 /// `--log <file>`, or `$REXSIM_LOG`. Passed on as a flag, because a new Rex pane doesn't
 /// inherit this process's environment.
@@ -240,6 +242,75 @@ fn bar_tool() -> Option<std::path::PathBuf> {
     ok.then_some(bin)
 }
 
+/// The scene helper (src/chrome.swift), compiled once like the bar.
+fn chrome_tool() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Library/Application Support/rexsim/bin");
+    let bin = dir.join("chrome-v1");
+    if bin.exists() {
+        return Some(bin);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let src = dir.join("chrome.swift");
+    std::fs::write(&src, include_str!("chrome.swift")).ok()?;
+    let ok = std::process::Command::new("swiftc")
+        .args(["-O", src.to_str()?, "-o", bin.to_str()?])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    ok.then_some(bin)
+}
+
+fn side_button(name: &str) -> Option<Button> {
+    Some(match name {
+        "action" => Button::Action,
+        "volup" => Button::VolumeUp,
+        "voldown" => Button::VolumeDown,
+        "lock" => Button::Lock,
+        _ => return None,
+    })
+}
+
+/// A side button on the drawn frame, in pane pixels.
+#[derive(Clone, Debug)]
+struct Side {
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// The wallpaper and frame PNGs for a pane of `pw`×`ph` pixels with the screen at
+/// `screen`, plus the frame's side buttons.
+fn scene(pw: u32, ph: u32, screen: (f64, f64, f64, f64)) -> Option<(Vec<u8>, Vec<u8>, Vec<Side>)> {
+    let tool = chrome_tool()?;
+    let dir = tool.parent()?.to_path_buf();
+    let (bg, fr) = (dir.join("bg.png"), dir.join("frame.png"));
+    let out = std::process::Command::new(&tool)
+        .args([
+            pw.to_string(),
+            ph.to_string(),
+            format!("{:.1}", screen.0),
+            format!("{:.1}", screen.1),
+            format!("{:.1}", screen.2),
+            format!("{:.1}", screen.3),
+            bg.to_str()?.into(),
+            fr.to_str()?.into(),
+        ])
+        .output()
+        .ok()?;
+    let sides = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let n = |i: usize| f.get(i)?.parse::<f64>().ok();
+            (f.first() == Some(&"btn")).then(|| Some(Side { name: f.get(1)?.to_string(), x: n(2)?, y: n(3)?, w: n(4)?, h: n(5)? }))?
+        })
+        .collect();
+    Some((std::fs::read(bg).ok()?, std::fs::read(fr).ok()?, sides))
+}
+
 /// The bar as PNG bytes for this size and pressed button, cached on disk.
 fn bar_png(w: u32, h: u32, pressed: Option<usize>) -> Option<Vec<u8>> {
     let tool = bar_tool()?;
@@ -272,6 +343,10 @@ fn send_png(out: &mut impl Write, id: u32, row: u16, col: u16, cols: u16, rows: 
 /// With Hydra in Rex, the buttons are native Liquid Glass drawn over the pane, so rexsim
 /// only says where the bar goes (a file Hydra reads) and takes presses from a FIFO.
 fn native_bar() -> bool {
+    // REXSIM_BUILTIN=1 draws rexsim's own frame and wallpaper even with Hydra installed.
+    if std::env::var_os("REXSIM_BUILTIN").is_some() {
+        return false;
+    }
     std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&format!("{h}/.hydra/Hydra.dylib")).exists())
 }
 
@@ -447,6 +522,10 @@ fn press_hw(driver: &Driver, hw: Hw, held: Duration) {
         Hw::Home => {
             driver.button(Button::Home, 1, hold);
             *WALL_DUE.lock().unwrap() = Some(Instant::now() + Duration::from_millis(1200));
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(1500));
+                WALL_GEN.fetch_add(1, Ordering::Relaxed);
+            });
         }
         Hw::Apps => driver.button(Button::Home, 2, 0.0),
         Hw::Lock => driver.button(Button::Lock, 1, hold),
@@ -839,6 +918,10 @@ struct Shared {
     buttons: Mutex<Vec<HwRect>>,
     pressed: Mutex<Option<Hw>>,
     toolbar_dirty: AtomicBool,
+    /// The drawn frame's side buttons, for clicks (pane pixels).
+    sides: Mutex<Vec<Side>>,
+    /// A finished scene waiting to be sent: (key, wallpaper, frame).
+    scene_ready: Mutex<Option<(String, Vec<u8>, Vec<u8>)>>,
 }
 
 fn norm(l: &Layout, x: f64, y: f64) -> (f64, f64) {
@@ -859,6 +942,7 @@ fn input_loop(driver: Arc<Driver>, sh: Arc<Shared>) {
     let mut wheel_dy = 0.0;
     let mods = Modifiers::default();
     let mut btn_down: Option<(Hw, Instant)> = None;
+    let mut side_down: Option<Button> = None;
     while !sh.quit.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 30) } > 0 {
@@ -907,6 +991,23 @@ fn input_loop(driver: Arc<Driver>, sh: Arc<Shared>) {
                 let l = *sh.layout.lock().unwrap();
                 let p = norm(&l, x - 1.0, y - 1.0);
                 log(format!("mouse b={b} press={press} px=({x},{y}) norm=({:.3},{:.3})", p.0, p.1));
+                // A click on the drawn frame's side buttons presses that button, live.
+                if b == 0 && !down {
+                    let (px, py) = (x - 1.0, y - 1.0);
+                    if press {
+                        let hit = sh.sides.lock().unwrap().iter()
+                            .find(|s| px >= s.x - 6.0 && px <= s.x + s.w + 6.0 && py >= s.y && py <= s.y + s.h)
+                            .map(|s| s.name.clone());
+                        if let Some(name) = hit.and_then(|n| side_button(&n)) {
+                            side_down = Some(name);
+                            driver.button_state(name, true);
+                            continue;
+                        }
+                    } else if let Some(name) = side_down.take() {
+                        driver.button_state(name, false);
+                        continue;
+                    }
+                }
                 if b == 0 && !down {
                     let (cw, ch) = *sh.cell.lock().unwrap();
                     let (col, row) = (((x - 1.0) / cw) as u16, ((y - 1.0) / ch) as u16);
@@ -1149,6 +1250,8 @@ fn main() {
         buttons: Mutex::new(Vec::new()),
         pressed: Mutex::new(None),
         toolbar_dirty: AtomicBool::new(false),
+        sides: Mutex::new(Vec::new()),
+        scene_ready: Mutex::new(None),
     });
     T0.get_or_init(Instant::now);
     LOG.get_or_init(|| {
@@ -1219,6 +1322,8 @@ fn main() {
     let mut sent_window = (Instant::now(), 0u64, 0.0f64);
     let mut next_status = Instant::now();
     let mut wall_done = false;
+    let mut scene_key = String::new();
+    let scene_busy = Arc::new(AtomicBool::new(false));
     let mut next_backdrop = Instant::now();
 
     while !sh.quit.load(Ordering::Relaxed) {
@@ -1322,6 +1427,35 @@ fn main() {
                 );
                 sent += 1;
                 log(format!("sent #{sent} id={new_id} seq={}", f.seq));
+            }
+            // Without a Rex mod drawing native chrome, rexsim draws its own: the phone's
+            // wallpaper behind the pane and a real device frame over the screen. Rebuilt
+            // in the background when the pane or phone moves, or after Home (new wallpaper).
+            if !native_bar() {
+                let (pw, ph) = ((ws.cols as f64 * cell.0) as u32, (ws.rows as f64 * cell.1) as u32);
+                let wall_gen = WALL_GEN.load(Ordering::Relaxed);
+                let key = format!("{pw}x{ph}:{:?}:{wall_gen}", l.px);
+                if key != scene_key && !scene_busy.load(Ordering::Relaxed) {
+                    scene_key = key.clone();
+                    scene_busy.store(true, Ordering::Relaxed);
+                    let (sh2, busy) = (sh.clone(), scene_busy.clone());
+                    let px = l.px;
+                    std::thread::spawn(move || {
+                        if let Some((bg, fr, sides)) = scene(pw, ph, px) {
+                            *sh2.sides.lock().unwrap() = sides;
+                            *sh2.scene_ready.lock().unwrap() = Some((key, bg, fr));
+                        }
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                }
+                if let Some((k, bg, fr)) = sh.scene_ready.lock().unwrap().take() {
+                    if k == scene_key {
+                        let _ = write!(out, "\x1b[?2026h\x1b7");
+                        send_png(&mut out, 3, 0, 0, ws.cols, ws.rows, -1, &bg);
+                        send_png(&mut out, 4, 0, 0, ws.cols, ws.rows, 2_000_000_000, &fr);
+                        let _ = write!(out, "\x1b8\x1b[?2026l");
+                    }
+                }
             }
             // The glow around the phone: a few times a second is plenty.
             let due = WALL_DUE.lock().unwrap().is_some_and(|t| Instant::now() >= t);
