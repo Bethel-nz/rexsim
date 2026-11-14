@@ -10,11 +10,8 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [dependencies]
-simdriver = "0.2.4"
+simdriver = "0.2.5"
 libc = "0.2"
 
 [profile.release]
 lto = "thin"
-
-[patch.crates-io]
-simdriver = { path = "vendor/simdriver" }
