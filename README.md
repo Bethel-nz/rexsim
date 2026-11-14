@@ -31,12 +31,60 @@ rexsim [--udid <udid>] [--fps N] [--split right|left|above|below] [--here] [--lo
 ## In the pane
 
 - **Touch:** click, drag and scroll on the phone. Type to send keys.
-- **Hardware buttons:** the toolbar under the phone has Home, Apps (the app switcher),
+- **Hardware buttons:** the glass bar above the phone has Home, Apps (the app switcher),
   Lock, Siri, and volume down and up. Click for a press; hold for more than half a second
   for a long press of that length, like a physical button.
+- **Side buttons:** click the Action, volume and lock buttons on the device frame. They
+  stay pressed for as long as you hold the mouse down.
 - **Width:** the pane sizes itself to fit the phone and snaps back to that width when the
   window or the pane next to it changes size. Use `--no-stick` to turn this off.
 - **Keys:** Ctrl-H presses Home. Ctrl-C quits.
+
+## Device frames
+
+rexsim draws a real device frame around the screen and the phone's own wallpaper behind
+it. The frames come from the [Apple Frames](https://www.macstories.net/) pack by
+MacStories. On first run rexsim downloads the pack and keeps only the iPhone portrait
+frames, in:
+
+```
+~/Library/Application Support/rexsim/frames/
+```
+
+For a device named `iPhone 18 Pro`, rexsim needs three things in that folder:
+
+- `iPhone 18 Pro Portrait.png`, the frame
+- `iPhone 18 Pro Portrait_mask.png`, the screen opening
+- an entry named `iPhone 18 Pro Portrait` in `NewFrames.json`, which says where the screen
+  sits in the frame
+
+If the phone shows without a frame, one of those is missing.
+
+**Adding a frame by hand.** Download the pack and unzip the frames into the folder:
+
+```sh
+F="$HOME/Library/Application Support/rexsim/frames"
+mkdir -p "$F"
+curl --http1.1 -fL -o /tmp/appleframes.zip \
+  "https://cdn.macstories.net/images/uploads/2026/11/10/appleframes421-1794327573824-2869ef1354.zip"
+unzip -o -j /tmp/appleframes.zip "Frames/NewFrames.json" \
+  "Frames/iPhone*Portrait*.png" -d "$F"
+```
+
+Some models only come in colours, such as `iPhone 18 Pro Portrait Silver.png`. Copy the
+colour you want to the plain name:
+
+```sh
+cp "$F/iPhone 18 Pro Portrait Silver.png" "$F/iPhone 18 Pro Portrait.png"
+```
+
+rexsim looks the frame up by the simulator's device type. To try a frame without that
+device, run `REXSIM_MODEL="iPhone 18 Pro" rexsim --here`. The new pane doesn't inherit
+your environment, so these variables only work with `--here` or from your shell profile.
+
+**Native chrome.** With the Hydra mod for Rex installed (`~/.hydra/Hydra.dylib`), Hydra
+draws Liquid Glass buttons, the frame and the wallpaper natively over the pane, and rexsim
+draws none of its own. Set `REXSIM_BUILTIN=1` to use rexsim's drawing anyway.
 
 ## How it works
 
