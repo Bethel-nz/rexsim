@@ -1,0 +1,27 @@
+[package]
+name = "simdriver"
+description = "Native iOS simulator frames, input, device controls, and accessibility for macOS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+readme = "../../README.md"
+keywords = ["ios", "simulator", "automation", "macos"]
+categories = ["development-tools::testing"]
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+
+[dev-dependencies]
+# header_is_current / gen_header generate include/simdriver.h from the crate.
+cbindgen = "0.29"
+
+# Stand-in helper process for unit tests (see the file's header).
+[[example]]
+name = "fake_helper"
+path = "tests/support/fake_helper.rs"

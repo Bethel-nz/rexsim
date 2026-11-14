@@ -21,13 +21,17 @@ use simdriver::{Button, DeviceSelector, Driver, Event, Frame, Modifiers, Options
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 // ---------- log ----------
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// When to grab the home screen as the pane's wallpaper: at start, and just after Home.
+static WALL_DUE: Mutex<Option<Instant>> = Mutex::new(None);
+/// Bumped a moment after Home, so rexsim's own wallpaper is redrawn.
+static WALL_GEN: AtomicU32 = AtomicU32::new(0);
 static LOG: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
 /// `--log <file>`, or `$REXSIM_LOG`. Passed on as a flag, because a new Rex pane doesn't
 /// inherit this process's environment.
@@ -86,6 +90,7 @@ impl Drop for RawMode {
         let mut out = std::io::stdout();
         let _ = out.write_all(LEAVE.as_bytes());
         let _ = out.flush();
+        unpublish_bar();
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
     }
 }
@@ -137,8 +142,10 @@ struct Layout {
     px: (f64, f64, f64, f64), // x, y, w, h in pane pixels
 }
 
-/// Rows under the phone: the hardware toolbar, plus the stats line with `--stats`.
-static CHROME_ROWS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+/// Rows under the phone: the stats line with `--stats`, else none.
+static CHROME_ROWS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// Rows above the phone: the glass button bar (two rows) and a row of air.
+const TOP_ROWS: u16 = 5;
 fn chrome_rows() -> u16 {
     CHROME_ROWS.load(Ordering::Relaxed)
 }
@@ -147,13 +154,14 @@ fn chrome_rows() -> u16 {
 /// closely as whole cells allow.
 fn layout(ws: WinSize, cell: (f64, f64), fw: u32, fh: u32) -> Layout {
     let (cw, ch) = cell;
-    let avail_rows = ws.rows.saturating_sub(chrome_rows()).max(1);
+    // The button bar and a gap on top, two rows of air (room for the frame) at the bottom.
+    let avail_rows = ws.rows.saturating_sub(TOP_ROWS + chrome_rows() + 2).max(1);
     let (aw, ah) = (ws.cols as f64 * cw, avail_rows as f64 * ch);
     let s = (aw / fw as f64).min(ah / fh as f64);
     let cols = ((fw as f64 * s / cw).round() as u16).clamp(1, ws.cols.max(1));
     let rows = ((fh as f64 * s / ch).round() as u16).clamp(1, avail_rows);
     let col0 = (ws.cols - cols) / 2;
-    let row0 = (avail_rows - rows) / 2;
+    let row0 = TOP_ROWS + (avail_rows - rows) / 2;
     Layout {
         col0,
         row0,
@@ -180,43 +188,329 @@ const HW: [(Hw, &str); 6] = [
     (Hw::Apps, "Apps"),
     (Hw::Lock, "Lock"),
     (Hw::Siri, "Siri"),
-    (Hw::VolDown, "Vol −"),
-    (Hw::VolUp, "Vol +"),
+    (Hw::VolDown, "Vol−"),
+    (Hw::VolUp, "Vol+"),
 ];
 
-/// A drawn button: cells `col0..col1` of `row`, 0-based.
+/// A button's cells: columns `col0..col1` of rows `row..=row1`, 0-based.
 #[derive(Clone, Copy, Debug)]
 struct HwRect {
     hw: Hw,
     row: u16,
+    row1: u16,
     col0: u16,
     col1: u16,
 }
 
-/// The toolbar row sits under the phone, centred on it, kept inside the pane.
-fn toolbar(ws: WinSize, l: &Layout) -> Vec<HwRect> {
-    let row = ws.rows.saturating_sub(chrome_rows());
-    let widths: Vec<u16> = HW.iter().map(|(_, s)| s.chars().count() as u16 + 2).collect();
-    let total: u16 = widths.iter().sum::<u16>() + (HW.len() as u16 - 1);
-    let centre = l.col0 + l.cols / 2;
-    let mut col = centre.saturating_sub(total / 2).min(ws.cols.saturating_sub(total));
-    let mut out = Vec::new();
-    for ((hw, _), w) in HW.iter().zip(widths) {
-        out.push(HwRect { hw: *hw, row, col0: col, col1: col + w });
-        col += w + 1;
-    }
-    out
+/// The glass bar spans the phone's width in the top two rows. Button slots match the
+/// drawing in bar.swift: equal slots inside the capsule's rounded ends.
+fn toolbar(_ws: WinSize, l: &Layout, cell: (f64, f64)) -> Vec<HwRect> {
+    let (cw, ch) = cell;
+    let w = l.cols as f64 * cw;
+    let inset = 6.0;
+    let bar_h = 2.0 * ch - inset * 2.0;
+    let slot = (w - inset * 2.0 - bar_h * 0.4) / HW.len() as f64;
+    let x0 = inset + bar_h * 0.2;
+    HW.iter()
+        .enumerate()
+        .map(|(i, (hw, _))| HwRect {
+            hw: *hw,
+            row: 0,
+            row1: 1,
+            col0: l.col0 + ((x0 + slot * i as f64) / cw) as u16,
+            col1: l.col0 + ((x0 + slot * (i + 1) as f64) / cw).ceil() as u16,
+        })
+        .collect()
 }
 
-fn draw_toolbar(out: &mut impl Write, ws: WinSize, rects: &[HwRect], pressed: Option<Hw>) {
-    let Some(first) = rects.first() else { return };
-    let _ = write!(out, "\x1b[{};1H\x1b[2K", first.row + 1);
-    for (r, (_, label)) in rects.iter().zip(HW.iter()) {
-        if r.col1 > ws.cols {
-            break;
+/// Where the compiled bar renderer lives; built from bar.swift on first use.
+fn bar_tool() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Library/Caches/rexsim");
+    let bin = dir.join("bar-v1");
+    if bin.exists() {
+        return Some(bin);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let src = dir.join("bar.swift");
+    std::fs::write(&src, include_str!("bar.swift")).ok()?;
+    let ok = std::process::Command::new("swiftc")
+        .args(["-O", src.to_str()?, "-o", bin.to_str()?])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    ok.then_some(bin)
+}
+
+/// The scene helper (src/chrome.swift), compiled once like the bar.
+fn chrome_tool() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Library/Application Support/rexsim/bin");
+    let bin = dir.join("chrome-v1");
+    if bin.exists() {
+        return Some(bin);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let src = dir.join("chrome.swift");
+    std::fs::write(&src, include_str!("chrome.swift")).ok()?;
+    let ok = std::process::Command::new("swiftc")
+        .args(["-O", src.to_str()?, "-o", bin.to_str()?])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    ok.then_some(bin)
+}
+
+fn side_button(name: &str) -> Option<Button> {
+    Some(match name {
+        "action" => Button::Action,
+        "volup" => Button::VolumeUp,
+        "voldown" => Button::VolumeDown,
+        "lock" => Button::Lock,
+        _ => return None,
+    })
+}
+
+/// A side button on the drawn frame, in pane pixels.
+#[derive(Clone, Debug)]
+struct Side {
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// The wallpaper and frame PNGs for a pane of `pw`×`ph` pixels with the screen at
+/// `screen`, plus the frame's side buttons.
+fn scene(pw: u32, ph: u32, screen: (f64, f64, f64, f64)) -> Option<(Vec<u8>, Vec<u8>, Vec<Side>)> {
+    let tool = chrome_tool()?;
+    let dir = tool.parent()?.to_path_buf();
+    let (bg, fr) = (dir.join("bg.png"), dir.join("frame.png"));
+    let out = std::process::Command::new(&tool)
+        .args([
+            pw.to_string(),
+            ph.to_string(),
+            format!("{:.1}", screen.0),
+            format!("{:.1}", screen.1),
+            format!("{:.1}", screen.2),
+            format!("{:.1}", screen.3),
+            bg.to_str()?.into(),
+            fr.to_str()?.into(),
+        ])
+        .output()
+        .ok()?;
+    let sides = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let n = |i: usize| f.get(i)?.parse::<f64>().ok();
+            (f.first() == Some(&"btn")).then(|| Some(Side { name: f.get(1)?.to_string(), x: n(2)?, y: n(3)?, w: n(4)?, h: n(5)? }))?
+        })
+        .collect();
+    Some((std::fs::read(bg).ok()?, std::fs::read(fr).ok()?, sides))
+}
+
+/// The bar as PNG bytes for this size and pressed button, cached on disk.
+fn bar_png(w: u32, h: u32, pressed: Option<usize>) -> Option<Vec<u8>> {
+    let tool = bar_tool()?;
+    let p = pressed.map_or(-1, |i| i as i64);
+    let out = tool.with_file_name(format!("bar-{w}x{h}-{p}.png"));
+    if !out.exists() {
+        std::process::Command::new(&tool)
+            .args([w.to_string(), h.to_string(), p.to_string(), "2".into(), out.to_str()?.into()])
+            .status()
+            .ok()?;
+    }
+    std::fs::read(out).ok()
+}
+
+/// Sends a PNG in 4 KB base64 chunks (the graphics protocol's limit per escape).
+fn send_png(out: &mut impl Write, id: u32, row: u16, col: u16, cols: u16, rows: u16, z: i32, png: &[u8]) {
+    let data = b64(png);
+    let chunks: Vec<&str> = data.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap()).collect();
+    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+    for (i, c) in chunks.iter().enumerate() {
+        let more = if i + 1 < chunks.len() { 1 } else { 0 };
+        if i == 0 {
+            let _ = write!(out, "\x1b_Ga=T,f=100,i={id},p=1,z={z},c={cols},r={rows},C=1,q=2,m={more};{c}\x1b\\");
+        } else {
+            let _ = write!(out, "\x1b_Gm={more};{c}\x1b\\");
         }
-        let style = if pressed == Some(r.hw) { "\x1b[7m" } else { "\x1b[48;5;237m\x1b[38;5;252m" };
-        let _ = write!(out, "\x1b[{};{}H{style} {label} \x1b[0m", r.row + 1, r.col0 + 1);
+    }
+}
+
+/// With Hydra in Rex, the buttons are native Liquid Glass drawn over the pane, so rexsim
+/// only says where the bar goes (a file Hydra reads) and takes presses from a FIFO.
+fn native_bar() -> bool {
+    // REXSIM_BUILTIN=1 draws rexsim's own frame and wallpaper even with Hydra installed.
+    if std::env::var_os("REXSIM_BUILTIN").is_some() {
+        return false;
+    }
+    std::env::var("HOME").is_ok_and(|h| std::path::Path::new(&format!("{h}/.hydra/Hydra.dylib")).exists())
+}
+
+fn panes_dir() -> Option<std::path::PathBuf> {
+    let d = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Library/Application Support/rexsim/panes");
+    std::fs::create_dir_all(&d).ok()?;
+    Some(d)
+}
+
+/// Tells Hydra which pane this is and where the bar sits in it, in cells.
+fn publish_bar(l: &Layout, cell: (f64, f64)) {
+    let (Some(dir), Ok(block), Ok(session)) = (panes_dir(), std::env::var("REX_BLOCK"), std::env::var("REX_SESSION")) else { return };
+    let pid = std::process::id();
+    let json = format!(
+        r#"{{"pid":{pid},"block":"{block}","session":"{session}","fifo":"{}","col0":{},"row0":0,"cols":{},"rows":{},"cw":{},"ch":{},"px":[{},{},{},{}],"grid":[{},{}]}}"#,
+        dir.join(format!("{pid}.fifo")).display(),
+        l.col0,
+        l.cols,
+        l.row0,
+        cell.0,
+        cell.1,
+        l.px.0,
+        l.px.1,
+        l.px.2,
+        l.px.3,
+        { let w = winsize(); w.cols as f64 * cell.0 },
+        { let w = winsize(); w.rows as f64 * cell.1 }
+    );
+    let _ = std::fs::write(dir.join(format!("{pid}.json")), json);
+}
+
+/// Reads "home", "apps", "lock", "siri", "voldown" or "volup", each optionally with a
+/// hold time in seconds, one per line, from Hydra's buttons.
+fn listen_bar(driver: Arc<Driver>) {
+    let Some(dir) = panes_dir() else { return };
+    let path = dir.join(format!("{}.fifo", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let Ok(c) = CString::new(path.to_string_lossy().as_bytes()) else { return };
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } != 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        loop {
+            let Ok(f) = std::fs::File::open(&path) else { return };
+            for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+                let mut it = line.split_whitespace();
+                let head = it.next();
+                if head == Some("down") || head == Some("up") {
+                    // Live press: "down volup" when the mouse goes down, "up volup" when it lifts.
+                    let b = match it.next() {
+                        Some("volup") => Some(Button::VolumeUp),
+                        Some("voldown") => Some(Button::VolumeDown),
+                        Some("lock") => Some(Button::Lock),
+                        Some("action") => Some(Button::Action),
+                        Some("home") => Some(Button::Home),
+                        Some("siri") => Some(Button::Siri),
+                        _ => None,
+                    };
+                    if let Some(b) = b {
+                        driver.button_state(b, head == Some("down"));
+                    }
+                    continue;
+                }
+                if head == Some("touch") {
+                    // "touch down|move|up x y" straight from Rex, 0..1: no trip through the terminal.
+                    let ph = it.next();
+                    let v: Vec<f64> = it.filter_map(|s| s.parse().ok()).collect();
+                    if let [x, y] = v[..] {
+                        let phase = match ph {
+                            Some("down") => Phase::Down,
+                            Some("up") => Phase::Up,
+                            _ => Phase::Move,
+                        };
+                        driver.pointer(phase, x, y, Modifiers::default());
+                    }
+                    continue;
+                }
+                if head == Some("scroll") {
+                    // "scroll began|changed|ended|momentum x y dx dy" from the trackpad, all 0..1.
+                    let ph = match it.next() {
+                        Some("began") => ScrollPhase::Began,
+                        Some("ended") => ScrollPhase::Ended,
+                        Some("momentum") => ScrollPhase::Momentum,
+                        _ => ScrollPhase::Changed,
+                    };
+                    let v: Vec<f64> = it.filter_map(|s| s.parse().ok()).collect();
+                    if let [x, y, dx, dy] = v[..] {
+                        driver.scroll(ph, x, y, dx, dy);
+                    }
+                    continue;
+                }
+                let hw = match head {
+                    Some("home") => Hw::Home,
+                    Some("apps") => Hw::Apps,
+                    Some("lock") => Hw::Lock,
+                    Some("siri") => Hw::Siri,
+                    Some("voldown") => Hw::VolDown,
+                    Some("volup") => Hw::VolUp,
+                    Some("action") => {
+                        driver.button(Button::Action, 1, it.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0));
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let held = it.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                press_hw(&driver, hw, Duration::from_secs_f32(held));
+            }
+        }
+    });
+}
+
+/// A 120-pixel-wide copy of the screen for Hydra's glow behind the pane:
+/// "w h\n" then RGBA. Written to a temp file and renamed, so Hydra never reads half.
+fn write_glow(f: &Frame) {
+    let Some(dir) = panes_dir() else { return };
+    let (w, h) = (f.width as usize, f.height as usize);
+    let gw = 120usize;
+    let gh = (gw * h / w.max(1)).max(1);
+    let mut out = format!("{gw} {gh}\n").into_bytes();
+    for y in 0..gh {
+        for x in 0..gw {
+            // Average the whole block, so the picture is smooth rather than speckled.
+            let (x0, x1, y0, y1) = (x * w / gw, ((x + 1) * w / gw).max(x * w / gw + 1), y * h / gh, ((y + 1) * h / gh).max(y * h / gh + 1));
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for yy in (y0..y1).step_by(2) {
+                for xx in (x0..x1).step_by(2) {
+                    let i = (yy * w + xx) * 4;
+                    b += f.data[i] as u32;
+                    g += f.data[i + 1] as u32;
+                    r += f.data[i + 2] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            out.extend_from_slice(&[(r / n) as u8, (g / n) as u8, (b / n) as u8, 255]);
+        }
+    }
+    let pid = std::process::id();
+    let tmp = dir.join(format!("{pid}.glow.tmp"));
+    if std::fs::write(&tmp, out).is_ok() {
+        let _ = std::fs::rename(tmp, dir.join(format!("{pid}.glow")));
+    }
+}
+
+fn unpublish_bar() {
+    if let Some(dir) = panes_dir() {
+        let pid = std::process::id();
+        let _ = std::fs::remove_file(dir.join(format!("{pid}.json")));
+        let _ = std::fs::remove_file(dir.join(format!("{pid}.fifo")));
+        let _ = std::fs::remove_file(dir.join(format!("{pid}.glow")));
+    }
+}
+
+fn draw_toolbar(out: &mut impl Write, l: &Layout, cell: (f64, f64), pressed: Option<Hw>) {
+    if native_bar() {
+        publish_bar(l, cell);
+        return;
+    }
+    let w = (l.cols as f64 * cell.0).round() as u32;
+    let h = (2.0 * cell.1).round() as u32;
+    let idx = pressed.and_then(|p| HW.iter().position(|(hw, _)| *hw == p));
+    if let Some(png) = bar_png(w, h, idx) {
+        send_png(out, 10, 0, l.col0, l.cols, 2, 5, &png);
     }
 }
 
@@ -225,7 +519,14 @@ fn draw_toolbar(out: &mut impl Write, ws: WinSize, rects: &[HwRect], pressed: Op
 fn press_hw(driver: &Driver, hw: Hw, held: Duration) {
     let hold = if held > Duration::from_millis(500) { held.as_secs_f32() } else { 0.0 };
     match hw {
-        Hw::Home => driver.button(Button::Home, 1, hold),
+        Hw::Home => {
+            driver.button(Button::Home, 1, hold);
+            *WALL_DUE.lock().unwrap() = Some(Instant::now() + Duration::from_millis(1200));
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(1500));
+                WALL_GEN.fetch_add(1, Ordering::Relaxed);
+            });
+        }
         Hw::Apps => driver.button(Button::Home, 2, 0.0),
         Hw::Lock => driver.button(Button::Lock, 1, hold),
         Hw::Siri => driver.button(Button::Siri, 1, hold),
@@ -251,12 +552,30 @@ struct Stick {
 
 /// Columns the phone needs at this pane height, plus a column of margin each side.
 fn phone_cols(ws: WinSize, cell: (f64, f64), fw: u32, fh: u32) -> u16 {
-    let rows = ws.rows.saturating_sub(chrome_rows()).max(1) as f64;
-    ((rows * cell.1 * fw as f64 / fh as f64) / cell.0).ceil() as u16 + 2
+    let rows = ws.rows.saturating_sub(TOP_ROWS + chrome_rows() + 2).max(1) as f64;
+    // The phone plus a little margin each side.
+    ((rows * cell.1 * fw as f64 / fh as f64) / cell.0).ceil() as u16 + 6
 }
 
-fn block_cols(block: &str) -> Option<f64> {
-    let out = std::process::Command::new("rex").args(["block", "call", "-b", block, "size"]).output().ok()?;
+/// The other pane in this pane's window, for when the pane rexsim was opened beside has
+/// since been replaced.
+fn neighbour(session: &str, me: &str) -> Option<String> {
+    let out = std::process::Command::new("rex").args(["block", "ls", "-s", session, "--json"]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let field = |part: &str, key: &str| -> Option<String> {
+        let i = part.find(&format!("\"{key}\": \""))? + key.len() + 5;
+        Some(part[i..].split('"').next()?.to_string())
+    };
+    let blocks: Vec<(String, String)> = s
+        .split("{")
+        .filter_map(|p| Some((field(p, "block_id")?, field(p, "window_id")?)))
+        .collect();
+    let win = blocks.iter().find(|(b, _)| b == me)?.1.clone();
+    blocks.into_iter().find(|(b, w)| *w == win && b != me).map(|(b, _)| b)
+}
+
+fn block_cols(session: &str, block: &str) -> Option<f64> {
+    let out = std::process::Command::new("rex").args(["block", "call", "-s", session, "-b", block, "size"]).output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     let rest = &s[s.find("\"columns\":")? + 10..];
     rest.trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
@@ -294,7 +613,14 @@ impl Stick {
         self.last = Some(Instant::now());
         let (session, me, anchor, after) = (self.session.clone(), self.me.clone(), self.anchor.clone(), self.after);
         std::thread::spawn(move || {
-            let Some(other) = block_cols(&anchor) else { return };
+            let (anchor, other) = match block_cols(&session, &anchor) {
+                Some(c) => (anchor, c),
+                None => {
+                    let Some(n) = neighbour(&session, &me) else { return };
+                    let Some(c) = block_cols(&session, &n) else { return };
+                    (n, c)
+                }
+            };
             let total = other + cols as f64;
             let mine = (target as f64 / total).clamp(0.1, 0.9);
             let (before, after_id, ratio) = if after { (&anchor, &me, 1.0 - mine) } else { (&me, &anchor, mine) };
@@ -339,8 +665,182 @@ struct ShmWriter {
     leaks: u64,
 }
 
+/// Turns a BGRA frame into RGBA at no more than the size it's shown at, on every core:
+/// the simulator's frames are about 3x the pane's pixels, and sending them full size
+/// is most of the per-frame cost. Box-averages `k`x`k` blocks, so text stays crisp.
+fn prepare(f: &Frame, shown_w: f64) -> (Vec<u8>, usize, usize) {
+    let (w, h) = (f.width as usize, f.height as usize);
+    let k = ((w as f64 / shown_w.max(1.0)).floor() as usize).clamp(1, 4);
+    let (w2, h2) = (w / k, h / k);
+    let mut out = vec![0u8; w2 * h2 * 4];
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let band = h2.div_ceil(threads);
+    let src = &f.data;
+    std::thread::scope(|sc| {
+        for (b, chunk) in out.chunks_mut(band * w2 * 4).enumerate() {
+            sc.spawn(move || {
+                let y0 = b * band;
+                for (dy, row) in chunk.chunks_exact_mut(w2 * 4).enumerate() {
+                    let y = (y0 + dy) * k;
+                    for x in 0..w2 {
+                        let (mut r, mut g, mut bl) = (0u32, 0u32, 0u32);
+                        for yy in y..y + k {
+                            let base = (yy * w + x * k) * 4;
+                            for xx in 0..k {
+                                let i = base + xx * 4;
+                                bl += src[i] as u32;
+                                g += src[i + 1] as u32;
+                                r += src[i + 2] as u32;
+                            }
+                        }
+                        let n = (k * k) as u32;
+                        let o = x * 4;
+                        row[o] = (r / n) as u8;
+                        row[o + 1] = (g / n) as u8;
+                        row[o + 2] = (bl / n) as u8;
+                        row[o + 3] = 255;
+                    }
+                }
+            });
+        }
+    });
+    round_corners(&mut out, w2, h2);
+    (out, w2, h2)
+}
+
+/// The phone's screen, blown up, blurred and dimmed to fill the pane around it, like the
+/// ambient glow behind a video. `pw`x`ph` is the pane's shape; the result is small and the
+/// terminal stretches it.
+fn backdrop(f: &Frame, pw: f64, ph: f64) -> (Vec<u8>, usize, usize) {
+    let bw = 72usize;
+    let bh = ((bw as f64 * ph / pw.max(1.0)).round() as usize).clamp(8, 400);
+    let (w, h) = (f.width as f64, f.height as f64);
+    // Aspect-fill the frame into the backdrop.
+    let s = (bw as f64 / w).max(bh as f64 / h);
+    let (ox, oy) = ((w * s - bw as f64) / 2.0, (h * s - bh as f64) / 2.0);
+    let mut img = vec![0f32; bw * bh * 3];
+    for y in 0..bh {
+        for x in 0..bw {
+            let sx = (((x as f64 + ox) / s) as usize).min(f.width as usize - 1);
+            let sy = (((y as f64 + oy) / s) as usize).min(f.height as usize - 1);
+            let i = (sy * f.width as usize + sx) * 4;
+            let o = (y * bw + x) * 3;
+            img[o] = f.data[i + 2] as f32;
+            img[o + 1] = f.data[i + 1] as f32;
+            img[o + 2] = f.data[i] as f32;
+        }
+    }
+    // Three box blurs make a soft, Gaussian-like glow.
+    let rad = 5i64;
+    for _ in 0..3 {
+        for pass in 0..2 {
+            let src = img.clone();
+            for y in 0..bh as i64 {
+                for x in 0..bw as i64 {
+                    let mut acc = [0f32; 3];
+                    let mut n = 0f32;
+                    for d in -rad..=rad {
+                        let (sx, sy) = if pass == 0 { (x + d, y) } else { (x, y + d) };
+                        if sx < 0 || sy < 0 || sx >= bw as i64 || sy >= bh as i64 {
+                            continue;
+                        }
+                        let i = (sy as usize * bw + sx as usize) * 3;
+                        acc[0] += src[i];
+                        acc[1] += src[i + 1];
+                        acc[2] += src[i + 2];
+                        n += 1.0;
+                    }
+                    let o = (y as usize * bw + x as usize) * 3;
+                    img[o] = acc[0] / n;
+                    img[o + 1] = acc[1] / n;
+                    img[o + 2] = acc[2] / n;
+                }
+            }
+        }
+    }
+    // Dim it so the phone stays the brightest thing in the pane.
+    let mut out = vec![0u8; bw * bh * 4];
+    for (o, c) in out.chunks_exact_mut(4).zip(img.chunks_exact(3)) {
+        o[0] = (c[0] * 0.55) as u8;
+        o[1] = (c[1] * 0.55) as u8;
+        o[2] = (c[2] * 0.55) as u8;
+        o[3] = 235;
+    }
+    (out, bw, bh)
+}
+
+/// Cuts the frame's corners to the phone's own curve (about 13.7% of its width on
+/// current iPhones), with a one-pixel soft edge so it doesn't look jagged.
+/// The iPhone 17 Pro screen's corner, measured from the Apple Frames picture the pane's
+/// device frame uses: for each row from the top of a 1206-pixel-wide screen, how many
+/// pixels are cut off at the side. Using the same curve keeps the screen flush with the frame.
+const CORNER: [u16; 219] = [211,190,178,170,163,156,150,145,141,137,133,129,126,123,121,118,115,112,110,108,106,103,101,99,97,95,93,91,90,88,86,85,83,81,80,79,77,76,74,73,72,70,69,68,67,65,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,47,45,45,44,43,42,41,41,40,39,38,38,37,36,36,35,34,34,33,32,32,31,30,30,29,29,28,27,27,27,26,26,25,24,24,23,23,22,22,21,21,21,20,20,19,19,18,18,17,17,17,16,16,16,15,15,15,14,14,14,13,13,13,12,12,12,11,11,11,11,10,10,10,10,9,9,9,9,8,8,8,8,7,7,7,7,6,6,6,6,6,6,6,5,5,5,5,5,5,5,4,4,4,4,4,4,4,3,3,3,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0];
+
+fn round_corners(px: &mut [u8], w: usize, h: usize) {
+    let k = w as f64 / 1206.0;
+    // With Hydra the frame sits on top with its opening ~9 (of 1206) pixels inside the
+    // screen, so trim along a curve that far outside it: hidden under the bezel.
+    let o = if native_bar() { 9.0 } else { 0.0 };
+    let rows = ((CORNER.len() as f64 - o).max(1.0) * k).ceil() as usize;
+    if rows * 2 > h {
+        return;
+    }
+    for y in 0..rows {
+        // The cut at this row, between table rows, in this image's pixels.
+        let t = y as f64 / k + o;
+        let i = (t as usize).min(CORNER.len() - 1);
+        let j = (i + 1).min(CORNER.len() - 1);
+        let f = t - i as f64;
+        let cut = ((CORNER[i] as f64 * (1.0 - f) + CORNER[j] as f64 * f) - o).max(0.0) * k;
+        let full = cut.floor() as usize;
+        for x in 0..=full.min(w / 2) {
+            let a = if x < full { 0.0 } else { 1.0 - (cut - full as f64) };
+            let alpha = (a * 255.0).round() as u8;
+            for (cx, cy) in [(x, y), (w - 1 - x, y), (x, h - 1 - y), (w - 1 - x, h - 1 - y)] {
+                let p = &mut px[(cy * w + cx) * 4 + 3];
+                *p = (*p).min(alpha);
+            }
+        }
+    }
+}
+
 impl ShmWriter {
+    /// Put ready RGBA pixels into a new segment and return its name.
+    fn write_rgba(&mut self, rgba: &[u8]) -> Option<CString> {
+        self.n += 1;
+        let name = CString::new(format!("/sdp{}.{}", self.pid, self.n)).ok()?;
+        let len = rgba.len();
+        unsafe {
+            let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600);
+            if fd < 0 {
+                return None;
+            }
+            if libc::ftruncate(fd, len as libc::off_t) != 0 {
+                libc::close(fd);
+                libc::shm_unlink(name.as_ptr());
+                return None;
+            }
+            let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
+            libc::close(fd);
+            if p == libc::MAP_FAILED {
+                libc::shm_unlink(name.as_ptr());
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), p.cast::<u8>(), len);
+            libc::munmap(p, len);
+        }
+        self.recent.push_back(name.clone());
+        while self.recent.len() > 64 {
+            let old = self.recent.pop_front().unwrap();
+            if unsafe { libc::shm_unlink(old.as_ptr()) } == 0 {
+                self.leaks += 1;
+            }
+        }
+        Some(name)
+    }
+
     /// Copy `frame` (BGRA) into a new segment as RGBA and return its name.
+    #[allow(dead_code)]
     fn write(&mut self, frame: &Frame) -> Option<CString> {
         self.n += 1;
         let name = CString::new(format!("/sdp{}.{}", self.pid, self.n)).ok()?;
@@ -368,6 +868,7 @@ impl ShmWriter {
                 d[2] = s[0];
                 d[3] = 255;
             }
+            round_corners(dst, frame.width as usize, frame.height as usize);
             libc::munmap(p, len);
         }
         self.recent.push_back(name.clone());
@@ -417,6 +918,10 @@ struct Shared {
     buttons: Mutex<Vec<HwRect>>,
     pressed: Mutex<Option<Hw>>,
     toolbar_dirty: AtomicBool,
+    /// The drawn frame's side buttons, for clicks (pane pixels).
+    sides: Mutex<Vec<Side>>,
+    /// A finished scene waiting to be sent: (key, wallpaper, frame).
+    scene_ready: Mutex<Option<(String, Vec<u8>, Vec<u8>)>>,
 }
 
 fn norm(l: &Layout, x: f64, y: f64) -> (f64, f64) {
@@ -437,6 +942,7 @@ fn input_loop(driver: Arc<Driver>, sh: Arc<Shared>) {
     let mut wheel_dy = 0.0;
     let mods = Modifiers::default();
     let mut btn_down: Option<(Hw, Instant)> = None;
+    let mut side_down: Option<Button> = None;
     while !sh.quit.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
         if unsafe { libc::poll(&mut pfd, 1, 30) } > 0 {
@@ -485,10 +991,27 @@ fn input_loop(driver: Arc<Driver>, sh: Arc<Shared>) {
                 let l = *sh.layout.lock().unwrap();
                 let p = norm(&l, x - 1.0, y - 1.0);
                 log(format!("mouse b={b} press={press} px=({x},{y}) norm=({:.3},{:.3})", p.0, p.1));
+                // A click on the drawn frame's side buttons presses that button, live.
+                if b == 0 && !down {
+                    let (px, py) = (x - 1.0, y - 1.0);
+                    if press {
+                        let hit = sh.sides.lock().unwrap().iter()
+                            .find(|s| px >= s.x - 6.0 && px <= s.x + s.w + 6.0 && py >= s.y && py <= s.y + s.h)
+                            .map(|s| s.name.clone());
+                        if let Some(name) = hit.and_then(|n| side_button(&n)) {
+                            side_down = Some(name);
+                            driver.button_state(name, true);
+                            continue;
+                        }
+                    } else if let Some(name) = side_down.take() {
+                        driver.button_state(name, false);
+                        continue;
+                    }
+                }
                 if b == 0 && !down {
                     let (cw, ch) = *sh.cell.lock().unwrap();
                     let (col, row) = (((x - 1.0) / cw) as u16, ((y - 1.0) / ch) as u16);
-                    let hit = sh.buttons.lock().unwrap().iter().find(|r| r.row == row && (r.col0..r.col1).contains(&col)).map(|r| r.hw);
+                    let hit = sh.buttons.lock().unwrap().iter().find(|r| (r.row..=r.row1).contains(&row) && (r.col0..r.col1).contains(&col)).map(|r| r.hw);
                     if press {
                         if let Some(hw) = hit {
                             btn_down = Some((hw, Instant::now()));
@@ -559,6 +1082,9 @@ fn input_loop(driver: Arc<Driver>, sh: Arc<Shared>) {
             }
             match rest[0] {
                 0x03 => {
+                    if let Some(dir) = panes_dir() {
+                        let _ = std::fs::remove_file(dir.join("../restore"));
+                    }
                     sh.quit.store(true, Ordering::Relaxed);
                     sh.wake.notify_all();
                     return;
@@ -692,7 +1218,7 @@ fn main() {
         }
     }
     if stats {
-        CHROME_ROWS.store(2, Ordering::Relaxed);
+        CHROME_ROWS.store(1, Ordering::Relaxed);
     }
     if LOG_PATH.get().is_none() {
         if let Ok(p) = std::env::var("REXSIM_LOG") {
@@ -724,6 +1250,8 @@ fn main() {
         buttons: Mutex::new(Vec::new()),
         pressed: Mutex::new(None),
         toolbar_dirty: AtomicBool::new(false),
+        sides: Mutex::new(Vec::new()),
+        scene_ready: Mutex::new(None),
     });
     T0.get_or_init(Instant::now);
     LOG.get_or_init(|| {
@@ -775,7 +1303,16 @@ fn main() {
         let (d, s) = (driver.clone(), sh.clone());
         std::thread::spawn(move || input_loop(d, s))
     };
+    if native_bar() {
+        listen_bar(driver.clone());
+    }
 
+    // Remember this pane so Rex can bring it back after a relaunch. Ctrl-C (a real quit)
+    // removes it; Rex closing the pane under us leaves it.
+    if let (Some(dir), Ok(session)) = (panes_dir(), std::env::var("REX_SESSION")) {
+        let a = anchor.as_deref().unwrap_or("-");
+        let _ = std::fs::write(dir.join("../restore"), format!("{session}\n{a}\n{}\n", side.as_deref().unwrap_or("right")));
+    }
     let mut stick = if no_stick { None } else { Stick::from_args(anchor, side) };
     let mut shm = ShmWriter { pid: std::process::id(), n: 0, recent: VecDeque::new(), leaks: 0 };
     let mut last: Option<Frame> = None;
@@ -784,6 +1321,10 @@ fn main() {
     let mut sent = 0u64;
     let mut sent_window = (Instant::now(), 0u64, 0.0f64);
     let mut next_status = Instant::now();
+    let mut wall_done = false;
+    let mut scene_key = String::new();
+    let scene_busy = Arc::new(AtomicBool::new(false));
+    let mut next_backdrop = Instant::now();
 
     while !sh.quit.load(Ordering::Relaxed) {
         let fresh = {
@@ -855,7 +1396,8 @@ fn main() {
                 let _ = out.write_all(b"\x1b[2J\x1b_Ga=d,d=A,q=2\x1b\\");
                 dirty = false;
                 *sh.cell.lock().unwrap() = cell;
-                *sh.buttons.lock().unwrap() = toolbar(ws, &sh.layout.lock().unwrap());
+                *sh.buttons.lock().unwrap() = toolbar(ws, &sh.layout.lock().unwrap(), cell);
+                next_backdrop = Instant::now();
                 sh.toolbar_dirty.store(true, Ordering::Relaxed);
                 next_status = Instant::now(); // the clear wiped the status line too
                 if let Some(st) = stick.as_mut() {
@@ -863,7 +1405,8 @@ fn main() {
                 }
             }
             let l = *sh.layout.lock().unwrap();
-            if let Some(name) = shm.write(f) {
+            let (rgba, iw, ih) = prepare(f, l.px.2);
+            if let Some(name) = shm.write_rgba(&rgba) {
                 // Double-buffered: place the new frame under a second id (one z above the
                 // old), then delete the old image in the same write, so the terminal never
                 // renders a gap between the two.
@@ -873,8 +1416,8 @@ fn main() {
                     "\x1b[?2026h\x1b[{};{}H\x1b_Ga=T,t=s,f=32,s={},v={},i={},p=1,z={},c={},r={},C=1,q=0;{}\x1b\\\x1b_Ga=d,d=I,i={},q=2\x1b\\\x1b[?2026l",
                     l.row0 + 1,
                     l.col0 + 1,
-                    f.width,
-                    f.height,
+                    iw,
+                    ih,
                     new_id,
                     sent % 1_000_000,
                     l.cols,
@@ -885,10 +1428,60 @@ fn main() {
                 sent += 1;
                 log(format!("sent #{sent} id={new_id} seq={}", f.seq));
             }
+            // Without a Rex mod drawing native chrome, rexsim draws its own: the phone's
+            // wallpaper behind the pane and a real device frame over the screen. Rebuilt
+            // in the background when the pane or phone moves, or after Home (new wallpaper).
+            if !native_bar() {
+                let (pw, ph) = ((ws.cols as f64 * cell.0) as u32, (ws.rows as f64 * cell.1) as u32);
+                let wall_gen = WALL_GEN.load(Ordering::Relaxed);
+                let key = format!("{pw}x{ph}:{:?}:{wall_gen}", l.px);
+                if key != scene_key && !scene_busy.load(Ordering::Relaxed) {
+                    scene_key = key.clone();
+                    scene_busy.store(true, Ordering::Relaxed);
+                    let (sh2, busy) = (sh.clone(), scene_busy.clone());
+                    let px = l.px;
+                    std::thread::spawn(move || {
+                        if let Some((bg, fr, sides)) = scene(pw, ph, px) {
+                            *sh2.sides.lock().unwrap() = sides;
+                            *sh2.scene_ready.lock().unwrap() = Some((key, bg, fr));
+                        }
+                        busy.store(false, Ordering::Relaxed);
+                    });
+                }
+                if let Some((k, bg, fr)) = sh.scene_ready.lock().unwrap().take() {
+                    if k == scene_key {
+                        let _ = write!(out, "\x1b[?2026h\x1b7");
+                        send_png(&mut out, 3, 0, 0, ws.cols, ws.rows, -1, &bg);
+                        send_png(&mut out, 4, 0, 0, ws.cols, ws.rows, 2_000_000_000, &fr);
+                        let _ = write!(out, "\x1b8\x1b[?2026l");
+                    }
+                }
+            }
+            // The glow around the phone: a few times a second is plenty.
+            let due = WALL_DUE.lock().unwrap().is_some_and(|t| Instant::now() >= t);
+            if native_bar() && (due || !wall_done) {
+                *WALL_DUE.lock().unwrap() = None;
+                wall_done = true;
+                let _ = next_backdrop;
+                write_glow(f);
+            } else if false && Instant::now() >= next_backdrop {
+                next_backdrop = Instant::now() + Duration::from_millis(250);
+                let (bg, bw, bh) = backdrop(f, ws.cols as f64 * cell.0, ws.rows as f64 * cell.1);
+                if let Some(name) = shm.write_rgba(&bg) {
+                    let _ = write!(
+                        out,
+                        "\x1b[?2026h\x1b7\x1b[1;1H\x1b_Ga=T,t=s,f=32,s={bw},v={bh},i=3,p=1,z=-1,c={},r={},C=1,q=2;{}\x1b\\\x1b8\x1b[?2026l",
+                        ws.cols,
+                        ws.rows,
+                        b64(name.as_bytes()),
+                    );
+                }
+            }
         }
         if sh.toolbar_dirty.swap(false, Ordering::Relaxed) {
             let pressed = *sh.pressed.lock().unwrap();
-            draw_toolbar(&mut out, ws, &sh.buttons.lock().unwrap(), pressed);
+            let l = *sh.layout.lock().unwrap();
+            draw_toolbar(&mut out, &l, cell, pressed);
         }
         if sh.status_dirty.swap(false, Ordering::Relaxed) {
             let st = sh.state.lock().unwrap().clone();

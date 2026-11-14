@@ -1,0 +1,6 @@
+<!doctype html><meta name=viewport content="width=device-width"><style>
+body{margin:0;background:#111;height:100vh;overflow:hidden}
+.b{position:absolute;left:50%;top:40%;width:160px;height:160px;margin:-80px;background:linear-gradient(45deg,#f0a,#0af);border-radius:24px;animation:s 1s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+</style><div class=b></div><div id=c style="position:absolute;bottom:30%;width:100%;text-align:center;color:#fff;font:bold 64px system-ui"></div>
+<script>let n=0;(function f(){document.getElementById('c').textContent=++n;requestAnimationFrame(f)})()</script>

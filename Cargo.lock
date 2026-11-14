@@ -92,8 +92,6 @@ dependencies = [
 [[package]]
 name = "simdriver"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bcf2ca451002940116a6c3258c93ba9e6f8d7fbe7dfd572651aae15f8e691e0"
 dependencies = [
  "libc",
  "serde",
