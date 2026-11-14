@@ -8,7 +8,7 @@ driving the same simulator with the [`simdriver`](https://github.com/Bethel-nz/s
 CLI at the same time, and the pane shows everything they do.
 
 ```
-cargo install --git https://github.com/Bethel-nz/rexsim
+cargo install rexsim
 xcrun simctl boot "iPhone 18 Pro"    # or boot one from Xcode
 rexsim
 ```
